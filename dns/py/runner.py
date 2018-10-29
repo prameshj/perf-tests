@@ -21,16 +21,20 @@ import subprocess
 import time
 import traceback
 import yaml
-
+import threading
+import re
+import Queue
 from subprocess import PIPE
 
 from data import Parser, ResultDb
-from params import ATTRIBUTE_CLUSTER_DNS, Inputs, TestCases
+from params import ATTRIBUTE_CLUSTER_DNS, ATTRIBUTE_NODELOCAL_DNS, Inputs, TestCases, QueryFile, RunLengthSeconds
 
 _log = logging.getLogger(__name__)
 _app_label = 'app=dns-perf-server'
 _client_podname = 'dns-perf-client'
-
+_test_svc_label = 'app=test-svc'
+_dnsperf_qfile_name='queryfile-example-current'
+_dnsperf_qfile_path='ftp://ftp.nominum.com/pub/nominum/dnsperf/data/queryfile-example-current.gz'
 def add_prefix(prefix, text):
   return '\n'.join([prefix + l for l in text.split('\n')])
 
@@ -47,31 +51,44 @@ class Runner(object):
     self.deployment_yaml = yaml.load(open(self.args.deployment_yaml, 'r'))
     self.configmap_yaml = yaml.load(open(self.args.configmap_yaml, 'r')) if \
       self.args.configmap_yaml else None
-    self.service_yaml = yaml.load(open(self.args.service_yaml, 'r'))
+    self.service_yaml = yaml.load(open(self.args.service_yaml, 'r')) if \
+        self.args.service_yaml else None
     self.dnsperf_yaml = yaml.load(open(self.args.dnsperf_yaml, 'r'))
     self.test_params = TestCases.load_from_file(args.params)
+    if self.args.run_large_queries:
+      self.test_params.add_param(QueryFile().name, _dnsperf_qfile_name)
+    _log.info(yaml.dump(self.test_params))
+    self.args.testsvc_yaml = yaml.load(open(self.args.testsvc_yaml, 'r')) if \
+        self.args.testsvc_yaml else None
 
 
     self.server_node = None
     self.client_node = None
-
+    self.use_existing = False
     self.db = ResultDb(self.args.db) if self.args.db else None
 
     self.attributes = set()
 
     if self.args.use_cluster_dns:
       _log.info('Using cluster DNS for tests')
-      self.args.dns_ip = self._get_dns_ip()
+      self.args.dns_ip = self._get_dns_ip("kube-dns")
       self.attributes.add(ATTRIBUTE_CLUSTER_DNS)
-
-    _log.info('DNS service IP is %s', args.dns_ip)
+      self.use_existing = True
+    elif self.args.use_nodelocal_dns:
+      _log.info('Using nodelocal DNS cache for tests')
+      self.attributes.add(ATTRIBUTE_NODELOCAL_DNS)
+      self.args.dns_ip = self._get_dns_ip("nodelocaldns")
+      self.use_existing = True
+    elif self.args.dns_ip:
+      _log.info('DNS service IP is %s', args.dns_ip)
+      self.use_existing = True
 
   def go(self):
     """
     Run the performance tests.
     """
     self._select_nodes()
-
+    self._create_test_services()
     test_cases = self.test_params.generate(self.attributes)
     if len(test_cases) == 0:
       _log.warning('No test cases')
@@ -83,31 +100,34 @@ class Runner(object):
 
       last_deploy_yaml = None
       last_config_yaml = None
+      current_deploy_yaml = None
+      current_config_yaml = None
       for test_case in test_cases:
         try:
-          inputs = Inputs(self.deployment_yaml, self.configmap_yaml,
+          if self.args.run_nodelocaldns:
+            current_deploy_yaml = self.nodelocaldns_yaml
+          else:
+            current_deploy_yaml = self.deployment_yaml
+          inputs = Inputs(current_deploy_yaml, current_config_yaml,
                           ['/dnsperf', '-s', self.args.dns_ip])
           test_case.configure(inputs)
-          # pin server to a specific node
-          inputs.deployment_yaml['spec']['template']['spec']['nodeName'] = \
-              self.server_node
-
-          if not self.args.use_cluster_dns and (
-              yaml.dump(inputs.deployment_yaml) !=
+          if not self.use_existing and (
+              yaml.dump(current_deploy_yaml) !=
               yaml.dump(last_deploy_yaml) or
-              yaml.dump(inputs.configmap_yaml) !=
+              yaml.dump(current_config_yaml) !=
               yaml.dump(last_config_yaml)):
             _log.info('Creating server with new parameters')
             self._teardown()
-            self._create(inputs.deployment_yaml)
-            self._create(self.service_yaml)
-            if self.configmap_yaml is not None:
-              self._create(inputs.configmap_yaml)
+            if self.service_yaml is not None:
+              self._create(self.service_yaml)
+            if current_config_yaml is not None:
+              self._create(current_config_yaml)
+            self._create(current_deploy_yaml)
             self._wait_for_status(True)
 
           self._run_perf(test_case, inputs)
-          last_deploy_yaml = inputs.deployment_yaml
-          last_config_yaml = inputs.configmap_yaml
+          last_deploy_yaml = current_deploy_yaml
+          last_config_yaml = current_config_yaml
 
         except Exception:
           _log.info('Exception caught during run, cleaning up. %s',
@@ -147,10 +167,50 @@ class Runner(object):
     _log.debug('applying yaml: %s', yaml.dump(yaml_obj))
     ret, out, err = self._kubectl(yaml.dump(yaml_obj), 'create', '-f', '-')
     if ret != 0:
-      _log.error('Could not create dns: %d\nstdout:\n%s\nstderr:%s\n',
-                 ret, out, err)
+      _log.error('Could not create dns: %d\nstdout:\n%s\nstderr:%s\n%s\n',
+                 ret, out, err, yaml.dump(yaml_obj))
       raise Exception('create failed')
     _log.info('Create %s/%s ok', yaml_obj['kind'], yaml_obj['metadata']['name'])
+
+  def _run_top(self, output_q):
+    kubedns_top_args = ['-l', 'k8s-app=kube-dns', '-n', 'kube-system']
+    if self.args.use_nodelocal_dns or self.args.dns_ip:
+      top_args = ['-l', 'k8s-app=nodelocaldns', '-n', 'kube-system']
+    else:
+      top_args = ['-l', _app_label]
+    t_end = time.time() + 60
+    while time.time() < t_end:
+      code, out, err = self._kubectl(*([None, 'top', 'pod'] + top_args))
+      code, kubeout, err = self._kubectl(*([None, 'top', 'pod'] + kubedns_top_args))
+      cpu = re.findall(' \d+m ', out)
+      mem = re.findall(' \d+Mi ', out)
+      kcpu = re.findall(' \d+m ', kubeout)
+      kmem = re.findall(' \d+Mi ', kubeout)
+      max_cpu = 0
+      max_mem = 0
+      max_kubedns_cpu = 0
+      max_kubedns_mem = 0
+      for c in cpu:
+        val = int(re.findall('\d+', c)[0])
+        if val > max_cpu:
+          max_cpu = val
+      for m in mem:
+        val = int(re.findall('\d+', m)[0])
+        if val > max_mem:
+          max_mem = val
+      for c in kcpu:
+        val = int(re.findall('\d+', c)[0])
+        if val > max_kubedns_cpu:
+          max_kubedns_cpu = val
+      for m in kmem:
+        val = int(re.findall('\d+', m)[0])
+        if val > max_kubedns_mem:
+          max_kubedns_mem = val
+      time.sleep(2)
+      output_q.put(max_cpu)
+      output_q.put(max_mem)
+      output_q.put(max_kubedns_cpu)
+      output_q.put(max_kubedns_mem)
 
   def _run_perf(self, test_case, inputs):
     _log.info('Running test case: %s', test_case)
@@ -158,7 +218,9 @@ class Runner(object):
     output_file = '%s/run-%s/result-%s.out' % \
       (self.args.out_dir, test_case.run_id, test_case.run_subid)
     _log.info('Writing to output file %s', output_file)
-
+    res_usage = Queue.Queue()
+    dt = threading.Thread(target=self._run_top,args=[res_usage])
+    dt.start()
     header = '''### run_id {run_id}:{run_subid}
 ### date {now}
 ### settings {test_case}
@@ -177,6 +239,8 @@ class Runner(object):
 
       if code != 0:
         raise Exception('error running dnsperf')
+
+    dt.join()
 
     with open(output_file, 'w') as fh:
       results = {}
@@ -197,6 +261,10 @@ class Runner(object):
 
         for key, value in parser.results.items():
           results['data'][key] = value
+        results['data']['max_cpu'] = res_usage.get()
+        results['data']['max_memory'] = res_usage.get()
+        results['data']['max_kubedns_cpu'] = res_usage.get()
+        results['data']['max_kubedns_memory'] = res_usage.get()
         results['data']['histogram'] = parser.histogram
       except Exception, exc:
         _log.error('Error parsing results: %s', exc)
@@ -207,6 +275,15 @@ class Runner(object):
 
       if self.db is not None and results['data']['ok']:
         self.db.put(results)
+
+  def _create_test_services(self):
+    if not self.args.testsvc_yaml:
+      _log.info("Not creating test services since no yaml was provided")
+      return
+
+    for index in range(1,20):
+      self.args.testsvc_yaml['metadata']['name'] = "test-svc" + str(index)
+      self._create(self.args.testsvc_yaml)
 
   def _select_nodes(self):
     code, out, _ = self._kubectl(None, 'get', 'nodes', '-o', 'yaml')
@@ -231,7 +308,7 @@ class Runner(object):
 
     _log.info('Client node is %s', self.client_node)
 
-    if self.args.use_cluster_dns:
+    if self.args.use_cluster_dns or self.args.use_nodelocal_dns or self.args.run_nodelocaldns:
       return
 
     if self.args.server_node:
@@ -243,22 +320,24 @@ class Runner(object):
       self.server_node = nodes[0]
 
     _log.info('Server node is %s', self.server_node)
-  
-  def _get_dns_ip(self):
+
+  def _get_dns_ip(self, svcname):
     code, out, _ = self._kubectl(None, 'get', 'svc', '-o', 'yaml',
-                                'kube-dns', '-nkube-system')
+                                svcname, '-nkube-system')
     if code != 0:
-      raise Exception('error gettings cluster dns ip: %d', code)
- 
+      raise Exception('error gettings dns ip for service %s: %d' %(svcname, code))
+
     try:
       return yaml.load(out)['spec']['clusterIP']
     except:
-      raise Exception('error parsing kube dns service, could not get dns ip') 
+      raise Exception('error parsing %s service, could not get dns ip' %(svcname))
 
   def _teardown(self):
     _log.info('Starting server teardown')
 
     self._kubectl(None, 'delete', 'deployments', '-l', _app_label)
+    code, out, err = self._kubectl(None, 'delete', 'daemonset', '-l', _app_label)
+    _log.info('Server teardown output - %s, %s, %s, label - %s' %(code, out, err, _app_label))
     self._kubectl(None, 'delete', 'services', '-l', _app_label)
     self._kubectl(None, 'delete', 'configmap', '-l', _app_label)
 
@@ -266,11 +345,17 @@ class Runner(object):
 
     _log.info('Server teardown ok')
 
+    self._kubectl(None, 'delete', 'services', '-l', _test_svc_label)
+    if self.args.run_large_queries:
+      try:
+        subprocess.check_call(['rm', self.args.query_dir +_dnsperf_qfile_name])
+      except subprocess.CalledProcessError:
+        _log.info("Failed to delete query file")
+
   def _reset_client(self):
     self._teardown_client()
 
     self.dnsperf_yaml['spec']['nodeName'] = self.client_node
-
     self._create(self.dnsperf_yaml)
     while True:
       code, _, _ = self._kubectl(None, 'get', 'pod', _client_podname)
@@ -290,6 +375,17 @@ class Runner(object):
     self._copy_query_files()
 
   def _copy_query_files(self):
+    if self.args.run_large_queries:
+      try:
+        _log.info('Downloading large query file')
+        subprocess.check_call(['wget', _dnsperf_qfile_path])
+        subprocess.check_call(['gunzip', _dnsperf_qfile_path.split('/')[-1]])
+        subprocess.check_call(['mv', _dnsperf_qfile_name, self.args.query_dir])
+
+      except subprocess.CalledProcessError:
+          _log.info('Exception caught when downloading query files %s',
+                    traceback.format_exc())
+
     _log.info('Copying query files to client')
     tarfile_contents = subprocess.check_output(
         ['tar', '-czf', '-', self.args.query_dir])
@@ -339,10 +435,11 @@ class Runner(object):
             'exec', _client_podname, '--',
             'dig', '@' + self.args.dns_ip,
             'kubernetes.default.svc.cluster.local.')
+        _log.info('testing for active status - %s %s %s',code, out, err)
         if code == 0:
           break
 
-        _log.info('Waiting for DNS service to start')
+        _log.info('Waiting for DNS service to start %s err : %s', out, err)
 
         time.sleep(1)
 

@@ -38,6 +38,13 @@ def parse_args():
       '--dns-server', type=str, default='kube-dns',
       help='the type of dns server (kube-dns or coredns)')
   parser.add_argument(
+      '--run-nodelocaldns', action='store_true',
+      help='if set, creates the local cache as specified in nodelocaldns-yaml. '
+      'expects daemonset, service and config map in one yaml')
+  parser.add_argument(
+      '--nodelocaldns-yaml', type=str, default='',
+      help='yaml for the nodelocal dns daemonset')
+  parser.add_argument(
       '--deployment-yaml', type=str, default='',
       help='yaml for the dns server deployment')
   parser.add_argument(
@@ -56,6 +63,12 @@ def parse_args():
       '--params', type=str, required=True,
       help='perf test parameters')
   parser.add_argument(
+      '--run-large-queries', action='store_true',
+      help='runs large example query file from dnsperf repo')
+  parser.add_argument(
+      '--testsvc-yaml', type=str, default='cluster/testsvc.yaml',
+      help='yaml for creating test services to be queried by dnsperf')
+  parser.add_argument(
       '--out-dir', type=str, default='out',
       help='output directory')
   parser.add_argument(
@@ -71,9 +84,13 @@ def parse_args():
       '--use-cluster-dns', action='store_true',
       help='if set, use cluster DNS instead of creating one')
   parser.add_argument(
-      '--dns-ip', type=str, default='10.0.0.20',
-      help='IP to use for the DNS service. Note: --use-cluster-dns '
-        'implicitly sets the service-ip of kube-dns service')
+      '--use-nodelocal-dns', action='store_true',
+      help='if set, use nodelocal DNS cache instead of creating a dns server')
+  parser.add_argument(
+      '--dns-ip', type=str, default='',
+      help='IP of existing dns service to use for testing. Note: --use-cluster-dns '
+        'implicitly sets the service-ip of kube-dns service, '
+        '--use-nodelocal-dns implicitly sets the service-ip of nodelocaldns service')
   parser.add_argument(
       '-v', '--verbose', action='store_true',
       help='show verbose logging')
@@ -100,6 +117,10 @@ if __name__ == '__main__':
       args.service_yaml = 'cluster/coredns-service.yaml'
     if not args.configmap_yaml:
       args.configmap_yaml = 'cluster/coredns-configmap.yaml'
+
+    if args.run_nodelocaldns:
+      if not args.nodelocaldns_yaml:
+        args.nodelocaldns_yaml = "cluster/nodelocal-unbound.yaml"
 
   logging.basicConfig(
       level=logging.DEBUG if args.verbose else logging.INFO,
